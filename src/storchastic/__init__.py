@@ -1,4 +1,4 @@
-from injections import stochastify
+from storchastic.injections import stochastify
 
 
 class StochasticMeta(type):

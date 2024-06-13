@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def stochastify(cls):
@@ -38,22 +39,33 @@ def inject_init(cls):
 
     old_init = cls.__init__
 
-    def _init(self, *args, **kwargs):
-        old_init(self, *args, **kwargs)
+    def _replace_parameters(module):
         to_add = {}
         to_remove = []
-        for name, param in self.named_parameters():
+        for name, param in module.named_parameters():
+            # Skip nested parameters - we'll handle them with recursion to child modules
+            if "."  in name:
+                continue
+
             mean = nn.Parameter(param.data)
-            log_var = nn.Parameter(torch.zeros_like(param.data))
+            inv_softplus_std = nn.Parameter(torch.zeros_like(param.data) - 4.0)
             to_add[f"{name}_mean"] = mean
-            to_add[f"{name}_log_var"] = log_var
+            to_add[f"{name}_inv_softplus_var"] = inv_softplus_std
             to_remove.append(name)
 
         for name in to_remove:
-            delattr(self, name)
+            delattr(module, name)
 
         for name, param in to_add.items():
-            self.register_parameter(name, param)
+            module.register_parameter(name, param)
+
+        # Recurse on child modules
+        for name, child in module._modules.items():
+            _replace_parameters(child)
+
+    def _init(self, *args, **kwargs):
+        old_init(self, *args, **kwargs)
+        _replace_parameters(self)
 
     setattr(cls, "__init__", _init)
 
@@ -64,13 +76,20 @@ def inject_sample_parameters(cls):
 
     def _sample_parameters(self):
         for name, _ in self.named_parameters():
+            # Skip nested parameters - we'll handle them with recursion to child modules
+            if "." in name:
+                continue
+
             if name.endswith("_mean"):
                 param_name = name[:-5]
                 mean = getattr(self, f"{param_name}_mean")
-                log_var = getattr(self, f"{param_name}_log_var")
-                std = torch.exp(0.5 * log_var)
+                inv_softplus_std = getattr(self, f"{param_name}_inv_softplus_var")
+                std = F.softplus(inv_softplus_std)
                 sampled_param = mean + std * torch.randn_like(std)
                 setattr(self, param_name, sampled_param)
+
+        for name, child in self._modules.items():
+            _sample_parameters(child)
 
     setattr(cls, "sample_parameters", _sample_parameters)
 
