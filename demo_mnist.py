@@ -45,6 +45,9 @@ class MLP(nn.Module):
 
 
 class StochasticMLP(MLP, metaclass=StochasticMeta):
+    init_mean = 0.0
+    init_sigma = 0.1
+
     def average_forward(self, x, repeats: int = 1):
         return torch.log(sum(torch.softmax(self(x), dim=1) for _ in range(repeats)) / repeats)
 
@@ -92,7 +95,8 @@ def train(
     stats_fns = stats_fns or []
 
     train_loader, test_loader = get_mnist_loaders()
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     history = []
 
     def _checkpoint(ep):
@@ -105,6 +109,7 @@ def train(
                     "epoch": ep,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "history": history,
                 },
                 logs / f"checkpoint_ep{ep:03d}.pth",
@@ -127,11 +132,13 @@ def train(
             state = torch.load(latest_ckpt)
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
             starting_epoch = state["epoch"]
 
     for ep in trange(starting_epoch, epochs, desc="Epochs", leave=False, position=0):
         _checkpoint(ep)
         train_one_epoch(model, train_loader, optimizer, crit)
+        scheduler.step()
     _checkpoint(epochs)
 
     return model
@@ -153,7 +160,7 @@ if __name__ == "__main__":
     smlp_lamda_1 = train(
         model=StochasticMLP(),
         crit=last_layer_distribution_alpha_1.mixture_kl_loss,
-        epochs=20,
+        epochs=50,
         stats_fns=stats_fns,
         logs=logs_root / "smlp-1.0",
     )
@@ -161,7 +168,7 @@ if __name__ == "__main__":
     smlp_lamda_0 = train(
         model=StochasticMLP(),
         crit=last_layer_distribution_alpha_0.mixture_kl_loss,
-        epochs=20,
+        epochs=50,
         stats_fns=stats_fns,
         logs=logs_root / "smlp-0.0",
     )
@@ -169,7 +176,7 @@ if __name__ == "__main__":
     mlp_1 = train(
         model=MLP(),
         crit=last_layer_distribution_alpha_1.mixture_kl_loss,
-        epochs=20,
+        epochs=50,
         stats_fns=stats_fns,
         logs=logs_root / "mlp-1.0",
     )
@@ -177,7 +184,7 @@ if __name__ == "__main__":
     mlp_0 = train(
         model=MLP(),
         crit=last_layer_distribution_alpha_0.mixture_kl_loss,
-        epochs=20,
+        epochs=50,
         stats_fns=stats_fns,
         logs=logs_root / "mlp-0.0",
     )
