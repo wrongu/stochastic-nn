@@ -49,7 +49,8 @@ class StochasticMLP(MLP, metaclass=StochasticMeta):
     init_sigma = 0.1
 
     def average_forward(self, x, repeats: int = 1):
-        return torch.log(sum(torch.softmax(self(x), dim=1) for _ in range(repeats)) / repeats)
+        # TODO - generalize with torch.distributions.MixtureSameFamily
+        return torch.log(torch.mean(torch.softmax(self(x, repeats=repeats), dim=-1), dim=-2))
 
 
 def train_one_epoch(model, loader, optimizer, criterion):
@@ -85,6 +86,7 @@ def train(
     model,
     crit,
     epochs,
+    model_eval_fn=None,
     stats_fns: Optional[list[StatsFn]] = None,
     logs: Optional[Path] = None,
 ):
@@ -101,7 +103,7 @@ def train(
 
     def _checkpoint(ep):
         nonlocal writer, logs, model, optimizer, test_loader, crit
-        test_stats = evaluate(model, test_loader, stats_fns)
+        test_stats = evaluate(model, test_loader, stats_fns, model_call_fn=model_eval_fn)
         history.append(test_stats)
         if logs is not None:
             torch.save(
@@ -157,28 +159,24 @@ if __name__ == "__main__":
     ]
 
     print("Training Stochastic MLP (alpha=1.0, encourage mixture)")
+    model = StochasticMLP(repeats=10)
     smlp_lamda_1 = train(
-        model=StochasticMLP(),
-        crit=last_layer_distribution_alpha_1.mixture_kl_loss,
+        model=model,
+        crit=partial(last_layer_distribution_alpha_1.mixture_kl_loss, dim_samples=-2),
         epochs=50,
+        model_eval_fn=partial(model.average_forward, repeats=10),
         stats_fns=stats_fns,
         logs=logs_root / "smlp-1.0",
     )
     print("Training Stochastic MLP (alpha=0.0, encourage single-component VI solution)")
+    model = StochasticMLP(repeats=10)
     smlp_lamda_0 = train(
-        model=StochasticMLP(),
-        crit=last_layer_distribution_alpha_0.mixture_kl_loss,
+        model=model,
+        crit=partial(last_layer_distribution_alpha_0.mixture_kl_loss, dim_samples=-2),
         epochs=50,
+        model_eval_fn=partial(model.average_forward, repeats=10),
         stats_fns=stats_fns,
         logs=logs_root / "smlp-0.0",
-    )
-    print("Training Deterministic MLP (alpha=1.0, encourage mixture)")
-    mlp_1 = train(
-        model=MLP(),
-        crit=last_layer_distribution_alpha_1.mixture_kl_loss,
-        epochs=50,
-        stats_fns=stats_fns,
-        logs=logs_root / "mlp-1.0",
     )
     print("Training Deterministic MLP (alpha=0.0, encourage single-component VI solution)")
     mlp_0 = train(
@@ -192,7 +190,6 @@ if __name__ == "__main__":
     # Final stats - compare MLPs and SMLPs with different # of mixture components
     test_data = get_mnist_loaders()[1]
     final_stats = {
-        "MLP (alpha=1.0)": evaluate(mlp_1, test_data, stats_fns),
         "MLP (alpha=0.0)": evaluate(mlp_0, test_data, stats_fns),
         "SMLP (alpha=1.0, k=1)": evaluate(
             smlp_lamda_1,
@@ -232,13 +229,13 @@ if __name__ == "__main__":
         ),
     }
 
-    num_stats = len(final_stats["MLP (alpha=1.0)"])
+    num_stats = len(final_stats["MLP (alpha=0.0)"])
     figures = [plt.figure(figsize=(4, 3)) for _ in range(num_stats)]
     axes = [fig.add_subplot(1, 1, 1) for fig in figures]
     for x, (name, stats) in enumerate(final_stats.items()):
         for i, (stat_name, stat_value) in enumerate(stats.items()):
             axes[i].bar(x=x, height=stat_value)
-    for ax, name in zip(axes, final_stats["MLP (alpha=1.0)"].keys()):
+    for ax, name in zip(axes, final_stats["MLP (alpha=0.0)"].keys()):
         ax.set_title(name)
         ax.set_xticks(range(len(final_stats)), labels=final_stats.keys(), rotation=45)
     for fig in figures:

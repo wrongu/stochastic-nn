@@ -81,6 +81,7 @@ def inject_init(cls, init_mean: Optional[float] = None, init_sigma: float = 0.1)
             _replace_parameters(child)
 
     def _init(self, *args, **kwargs):
+        self.repeats = kwargs.pop("repeats", 1)
         old_init(self, *args, **kwargs)
         _replace_parameters(self)
 
@@ -116,7 +117,10 @@ def inject_forward(cls):
     old_forward = cls.forward
 
     def _forward(self, *args, **kwargs):
-        self.sample_parameters()
-        return old_forward(self, *args, **kwargs)
+        outputs = []
+        for r in range(kwargs.pop("repeats", self.repeats)):
+            self.sample_parameters()
+            outputs.append(old_forward(self, *args, **kwargs))
+        return torch.stack(outputs, dim=-2)
 
     setattr(cls, "forward", _forward)

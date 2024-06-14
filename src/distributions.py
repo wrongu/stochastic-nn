@@ -3,17 +3,23 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 import abc
+from typing import Optional
 
 
-def estimate_entropy_diagonal_gaussian(x: torch.Tensor) -> torch.Tensor:
+_LOG2PI = np.log(2 * np.pi)
+
+
+def estimate_entropy_diagonal_gaussian(
+    x: torch.Tensor, dim_samples: int, dim_theta: int, reduction: str = "mean"
+) -> torch.Tensor:
     """Given n x d matrix of n samples from a d-dimensional distribution, estimate the entropy of
     the distribution by fitting a diagonal Gaussian to the data and computing the entropy of the
     Gaussian. In general this is an upper bound to the true entropy of the distribution.
     """
-    d = x.size(1)
-    var = torch.var(x, dim=0, unbiased=True)
-    entropy = 0.5 * torch.sum(torch.log(2 * np.pi * var)) + 0.5 * d * (1 + np.log(2 * np.pi))
-    return entropy
+    d = x.size(dim_theta)
+    var = torch.var(x, dim=dim_samples, unbiased=True, keepdim=True)
+    entropy = 0.5 * torch.sum(torch.log(2 * np.pi * var), dim=dim_theta) + 0.5 * d * (1 + _LOG2PI)
+    return _reduce(entropy.squeeze(), reduction)
 
 
 def _reduce(x: torch.Tensor, reduction: str) -> torch.Tensor:
@@ -36,6 +42,7 @@ class DistributionLayer(nn.Module, metaclass=abc.ABCMeta):
         if alpha > 1.0:
             raise ValueError("Alpha must be less than or equal to 1.0.")
         self.alpha = alpha
+        self._vmap_cache = {}
 
     @abc.abstractmethod
     def num_params(self) -> int:
@@ -56,6 +63,18 @@ class DistributionLayer(nn.Module, metaclass=abc.ABCMeta):
         distribution. Subclasses may define the target distribution in different ways.
         """
 
+    def avg_klqp(self, dim_samples: Optional[int] = None, *args, **kwargs):
+        """Return the average KL divergence across samples in the batch."""
+        # TODO - this maybe-vmap pattern could be abstracted to a decorator
+        if dim_samples is None:
+            return self.klqp(*args, **kwargs)
+        else:
+            fn = self._vmap_cache.get(
+                ("klqp", dim_samples),
+                torch.vmap(self.klqp, in_dims=(dim_samples, None), out_dims=0),
+            )
+            return torch.mean(fn(*args, **kwargs), dim=0)
+
     def sample(self, theta: torch.Tensor, n: int) -> torch.Tensor:
         """Sample from the distribution parameterized by theta."""
         with torch.no_grad():
@@ -71,12 +90,25 @@ class DistributionLayer(nn.Module, metaclass=abc.ABCMeta):
         parameterized by theta.
         """
 
+    def avg_log_det_fisher(self, dim_samples: Optional[int] = None, *args, **kwargs):
+        """Return the average log det Fisher across samples in the batch."""
+        if dim_samples is None:
+            return self.log_det_fisher(*args, **kwargs)
+        else:
+            fn = self._vmap_cache.get(
+                ("log_det_fisher", dim_samples),
+                torch.vmap(self.log_det_fisher, in_dims=dim_samples, out_dims=0),
+            )
+            return torch.mean(fn(*args, **kwargs), dim=0)
+
     def mixture_kl_loss(
         self,
         theta: torch.Tensor,
         targets: torch.Tensor,
         reduction: str = "mean",
         return_components: bool = False,
+        dim_samples: Optional[int] = None,
+        dim_theta: int = -1,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Loss function estimating KL(m || p) where m is a stochastic mixture of components q_θ(z).
 
@@ -84,27 +116,27 @@ class DistributionLayer(nn.Module, metaclass=abc.ABCMeta):
         the mixture components. MI is E_θ[KL(q_θ || m)] (mutual information between θ and z),
         and we use the lower bound MI ≥ H[θ] + 0.5 E_θ[log(det(F(θ)))] as an estimate of the
         mutual information.
+
+        :param theta: Parameters of the mixture components q_θ(z), size (batch, [samples,] d).
+        :param targets: Target int labels, size (batch, 1).
+        :param reduction: Reduction method for the loss, one of 'mean', 'sum', or 'none'.
+        :param return_components: Return dict of components of the loss if True, otherwise return
+            the loss.
+        :param dim_samples: specifies which dimension is 'samples' (default None)
+        :param dim_theta: specifies which dimension is 'd' (default -1)
         """
-        b = theta.size(0)
-        klqp = self.klqp(theta, targets, reduction=reduction)
+        klqp = self.avg_klqp(dim_samples, theta, targets, reduction=reduction)
 
         if self.alpha > 0 or return_components:
             # Use variation across the batch in the constrained parameter space as an estimate of
             # the entropy of the distribution over parameters.
-            # TODO - this is a poor estimate of entropy for multiple reasons. Look into ways to
-            #  improve this estimate. Ideally we'd estimate entropy per item in the batch. Any
-            #  way to do that without sampling >1 times per input?
-            entropy_theta = estimate_entropy_diagonal_gaussian(self.project(theta))
-            if reduction == "none":
-                # This (poor) estimate of entropy is naturally mean-reduced across the batch. If
-                # user requests "none", we need to expand it back out to the full batch size and
-                # divide it equally among each item in the batch.
-                entropy_theta = entropy_theta.unsqueeze(0).expand_as(klqp) / b
-            elif reduction == "sum":
-                # If user requests "sum", we need to multiply the entropy by the batch size to
-                # compensate for the mean reduction that was applied to the entropy.
-                entropy_theta = entropy_theta * b
-            log_det_fisher = self.log_det_fisher(theta, reduction=reduction)
+            entropy_theta = estimate_entropy_diagonal_gaussian(
+                self.project(theta),
+                dim_theta=dim_theta,
+                dim_samples=dim_samples,
+                reduction=reduction,
+            )
+            log_det_fisher = self.avg_log_det_fisher(dim_samples, theta, reduction=reduction)
             mutual_information_lower_bound = entropy_theta + 0.5 * log_det_fisher
         else:
             mutual_information_lower_bound = torch.zeros_like(klqp)
